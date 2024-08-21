@@ -1,0 +1,491 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Setup-Monitoring-On-AWS-Site-to-Site-VPN
+Parameters:
+  SnsTopicARN:
+    Type: String
+    Description: '(Required) ARN of your SNS topic'
+    AllowedPattern: ^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):sns:[a-z]{2}(-gov)?(-iso[a-z]?)?-[a-z]{2,10}-[0-9]{1,2}:(\d{12}):[0-9a-zA-Z-_]{1,256}(.fifo)?$
+  VpnLogGroup:
+    Type: String
+    Description: '(Required) Log group associated with VPN Connection Id'
+    AllowedPattern: ^[\\.\\-_/#A-Za-z0-9]{1,512}
+  CreateNewLambdaRole:
+    Type: String
+    AllowedValues:
+      - 'yes'
+      - 'no'
+    Default: 'yes'
+    Description: '(Required) If given as - yes, a new Lambda execution role will be
+      created. You can choose yes if you dont have any existing Lambda role
+      which can be reused'
+  ExistingLambdaRoleARN:
+    Type: String
+    Description: '(Optional) Existing Lambda Role ARN which you would like to attach
+      to Lambda function. Please make sure this Role should have appropriate
+      permissions so that the automation can work as expected. If you have
+      chosen CreateNewLambdaRole as yes then you can leave this empty'
+  NotificationFrequency:
+    Type: String
+    Description: '(Optional) NotificationFrequency in hours. An error can keep
+      logging to CloudWatch log group at periodic interval if you do not rectify
+      those. This parameter denotes how frequently you want to get notified
+      till the error is fixed. For eg : if you put this as 2, then you will get
+      notified once in 2 hour if that error keeps coming and the error is not
+      fixed'
+    AllowedPattern: ^[1-9][0-9]?$
+    Default: '1'
+Conditions:
+  LambdaRoleCondition: !Equals
+    - !Ref CreateNewLambdaRole
+    - 'yes'
+
+Resources:
+
+  VPNNotificationDDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      Tags:
+        - Key: VpnLogGroup
+          Value: !Ref VpnLogGroup
+
+      AttributeDefinitions:
+        - AttributeName: vpnId_and_tunnelIp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: vpnId_and_tunnelIp
+          KeyType: HASH
+
+      BillingMode: PAY_PER_REQUEST
+      TableName: !Join
+        - ''
+        - - VPNNotification_status-
+          - !Ref VpnLogGroup
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - ''
+        - - /aws/lambda/SetupVPNMonitoring-
+          - !Ref VpnLogGroup
+      RetentionInDays: 30
+      Tags:
+        - Key: VpnLogGroup
+          Value: !Ref VpnLogGroup
+
+  NewLambdaExecutionRole:
+    Condition: LambdaRoleCondition
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: VpnLogGroup
+          Value: !Ref VpnLogGroup
+      Description: Lambda functions execution Role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-SNSNotificationLambdaPermissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref SnsTopicARN
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt VPNNotificationDDB.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LambdaLogGroup.Arn
+
+
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Tags:
+        - Key: VpnLogGroup
+          Value: !Ref VpnLogGroup
+      FunctionName: !Join
+        - ''
+        - - SetupVPNMonitoring-
+          - !Ref VpnLogGroup
+      Environment:
+        Variables:
+          SnsTopicARN: !Ref SnsTopicARN
+          VpnLogGroup: !Ref VpnLogGroup
+          VPNNotificationDDB: !Ref VPNNotificationDDB
+          NotificationFrequency: !Ref NotificationFrequency
+      Code:
+        ZipFile: |
+          import gzip
+          import base64
+          import json
+          import boto3
+          import os
+          import time
+          import sys
+          import botocore
+          from botocore.config import Config
+          from datetime import datetime, timedelta
+          sns_client=boto3.client('sns')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['VPNNotificationDDB'])
+          NotificationFrequency = int(os.environ['NotificationFrequency'])
+          NotificationFrequency = NotificationFrequency*60*60
+          def send_sns(error, resolution, account_id, vpnId, vpnIp, logGroup, functionName):
+            Message = ""
+            Message += f"\n AWS SetupVPNMonitoring Automation found an error \u275D {error} \u275E in your VPN with details as below\n"
+            Message += "\n------------------------------------------------------------------------------------------------------------------\n"
+            Message += f"\u276F Error : \u275D {error} \u275E \n"
+            Message += f"\u276F AWS Account ID: \'{account_id}\'\n"
+            Message += f"\u276F VPN ID: \'{vpnId}\'\n"
+            Message += f"\u276F TunnelIPAddress: \'{vpnIp}\'\n"
+            Message += f"\u276F CloudWatch log group : \'{logGroup}\'\n"
+            Message += f"\u276F Region  : \'{os.environ['AWS_REGION']}\'\n"
+            Message += "\n------------------------------------------------------------------------------------------------------------------\n"
+            Message += f"{resolution}\n\n-----------------------------------------------------------------------------------------------------------\n\n"
+            Message += f"Additional information : \n\n This SNS notification was invoked by Lambda function {functionName} which was created through AWS SetupVPNMonitoring Automation\n\n-----------------------------------------------------------------------------------------------------------\n\n"
+            Subject = "\u274C Error received for your vpn "+ vpnId + " Tunnel : " + vpnIp
+            try:
+              sns_client.publish(
+                      TopicArn = os.environ['SnsTopicARN'],
+                      Message = Message,
+                      Subject = Subject
+                      )
+            except botocore.exceptions.ClientError as error:
+              sys.exit(1)
+          def create_put_item(vpn_index, error, event_timestamp):
+            try:
+              response = table.put_item(
+                    Item={
+                          'vpnId_and_tunnelIp': vpn_index,
+                          error : event_timestamp
+                      }
+                  )
+            except botocore.exceptions.ClientError as error:
+              sys.exit(1)
+          def update_item(vpn_index, error, last_notification):
+            try:
+              response = table.update_item(
+                      ExpressionAttributeNames={
+                            '#EL': error}
+                            ,
+                      ExpressionAttributeValues={
+                            ':v': last_notification
+                        },
+                      Key={
+                          'vpnId_and_tunnelIp': vpn_index
+                          },
+                      UpdateExpression = "set #EL = :v"
+                  )
+            except botocore.exceptions.ClientError as error:
+              sys.exit(1)
+          def lambda_handler(event, context):
+              errorDescription = {
+                "Peer is not responsive" :"""
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has identified that your VPN tunnel went down due to Dead Peer Detection not being acknowledged by the customer gateway (CGW) device. AWS sends periodic DPD messages at configured intervals regardless of traffic inactivity. If the VPN peer does not respond to three successive DPDs, the VPN peer (CGW) is considered dead and AWS tears down the VPN tunnel. For detailed Information, please follow this documentation [1][2].
+                  Additionally, there are various potential reasons for a router to not be able to acknowledge the DPD messages sent by AWS VPN like CPU utilization on the device, power outage, loss of internet connectivity, or other internal configurational changes that might consume on-premises router resources and keep device busy as well.
+                  Next Steps:
+                  * In order to verify why the CGW device was not responding to our (AWS) DPD messages, we would recommend you to check the IPSec Logs on the CGW device to verify if you are able to see information pertaining to this issue.
+                  * To bring the VPN tunnel up you can restart your tunnel interface and initiate IKE and IPsec negotiations.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [3].
+                  References:
+                  [1] Resolution: https://aws.amazon.com/premiumsupport/knowledge-center/vpn-tunnel-instability-inactivity/.
+                  [2] DPD timeout action: https://docs.aws.amazon.com/vpn/latest/s2svpn/VPNTunnels.html
+                  [3] https://aws.amazon.com/support
+                  """,
+                "No Proposal Match Found by AWS" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that IKE Phase 1 parameters (such as encryption algorithm, hashing algorithm, and Diffie-Hellman (DH) group) configured on the customer gateway (CGW) device and the AWS VPN endpoint do not match. or that the CGW is using parameters that are not supported by the AWS VPN.
+                  Next Steps:
+                  * Verify that the Phase 1 parameters (such as encryption algorithm, hashing algorithm, and Diffie-Hellman (DH) group) that are being proposed by the CGW match those configured on the AWS side. If you are using default settings on the AWS side, then verify that the parameters being proposed are supported by the AWS VPN. To find a list of parameters supported by AWS Site-to-Site VPN you can follow this documentation [1].
+                  * If you want to modify the parameters on the AWS VPN side, you can follow these steps:
+                  Step 1: Open the Amazon VPC console at https://console.aws.amazon.com/vpc/
+                  Step 2: In the navigation pane, choose Site-to-Site VPN Connections.
+                  Step 3: Select the Site-to-Site VPN connection, and choose Actions, Modify VPN Tunnel Options.
+                  Step 4: For VPN Tunnel Outside IP Address, choose the tunnel endpoint IP of the VPN tunnel that your modifying options for.
+                  Step 5: Choose or enter new values for the tunnel options.
+                  Step 6: Choose Save.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [2].
+                  References:
+                  [1] Tunnel options: https://docs.aws.amazon.com/vpn/latest/s2svpn/VPNTunnels.html
+                  [2] https://aws.amazon.com/support
+                  """,
+                "No proposal chosen" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that IKE Phase 2 parameters (such as encryption algorithm, hashing algorithm, and Diffie-Hellman (DH) group) configured on the customer gateway (CGW) device and the AWS VPN endpoint do not match. or that the CGW is using parameters that are not supported by the AWS VPN.
+                  Next Steps:
+                  * Verify that the Phase 2 parameters (integrity algorithm, hashing algorithm, and Diffie-Hellman (DH) group) that are being proposed by the CGW match those configured on the AWS side. If you are using default settings on the AWS side, then verify that the parameters being proposed are supported by the AWS VPN. To find a list of parameters supported by AWS Site-to-Site VPN you can follow this documentation [1].
+                  * If you want to modify the parameters on the AWS VPN side, you can follow these steps:
+                  Step 1: Open the Amazon VPC console at https://console.aws.amazon.com/vpc/
+                  Step 2: In the navigation pane, choose Site-to-Site VPN Connections.
+                  Step 3: Select the Site-to-Site VPN connection, and choose Actions, Modify VPN Tunnel Options.
+                  Step 4: For VPN Tunnel Outside IP Address, choose the tunnel endpoint IP of the VPN tunnel that your modifying options for.
+                  Step 5: Choose or enter new values for the tunnel options.
+                  Step 6: Choose Save.
+                  For information on Phase 2 troubleshooting, you can refer to this document [2]
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [3].
+                  References:
+                  [1] Tunnel options: https://docs.aws.amazon.com/vpn/latest/s2svpn/VPNTunnels.html
+                  [2] Phase 2 Troubleshooting: https://aws.amazon.com/premiumsupport/knowledge-center/vpn-tunnel-phase-2-ipsec/
+                  [3] https://aws.amazon.com/support
+                  """,
+                "invalid Pre-shared Key" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that there is a pre-shared key mismatch between both the peer IPs. To resolve this issue Please verify that the PSK configured on the CGW device [1] and ensure it matches with the PSK matching with the downloaded configuration file. If you are using a custom PSK value, make sure it matches on both the CGW and AWS VPN console.
+                  Please follow these steps in order to verify the PSK:
+                  Step 1: Open the Amazon VPC console at https://console.aws.amazon.com/vpc/.
+                  Step 2: In the navigation pane, choose Site-to-Site VPN Connections.
+                  Step 3: Select your VPN connection and choose Download Configuration.
+                  Step 4: Select the vendor, platform, software and IKE version that correspond to your customer gateway device. If your device is not listed, choose Generic.
+                  Step 5: Choose Download.
+                  Step 6: Downloaded file will contain the pre-shared key.
+                  Or
+                  If you want to modify the PSK on the AWS VPN side, you can follow these steps:
+                  Step 1: Open the Amazon VPC console at https://console.aws.amazon.com/vpc/
+                  Step 2: In the navigation pane, choose Site-to-Site VPN Connections.
+                  Step 3: Select the Site-to-Site VPN connection, and choose Actions, Modify VPN Tunnel Options.
+                  Step 4: For VPN Tunnel Outside IP Address, choose the tunnel endpoint IP of the VPN tunnel that your modifying options for.
+                  Step 5: Choose or enter new values for the tunnel options (pre-shared key).
+                  Step 6: Choose Save.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [2].
+                  References:
+                  [1] Requirements for your customer gateway device: https://docs.aws.amazon.com/vpn/latest/s2svpn/your-cgw.html#CGRequirements
+                  [2] https://aws.amazon.com/support
+                  """,
+                "AWS tunnel received DELETE for Phase 2 SA" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has identified that your VPN tunnel went down because the customer gateway (CGW) sent a Delete_SA message for Phase 2. When AWS receives Delete_SA for Phase 2 from CGW, it deletes the Phase 2 of SPI mentioned in Delete_SA request.
+                  A possible reason for CGW sending the Delete_SA message is due to any configurational changes made on the CGW side.
+                  Next Steps:
+                  * Check IPSec Logs on the CGW device to verify if you are able to see information pertaining to this issue.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [3].
+                  References:
+                  [1] Tunnel stability issues during a rekey: https://aws.amazon.com/premiumsupport/knowledge-center/vpn-fix-ikev2-tunnel-instability-rekey/
+                  [2] Phase 2 Troubleshooting: https://aws.amazon.com/premiumsupport/knowledge-center/vpn-tunnel-phase-2-ipsec/
+                  [3] https://aws.amazon.com/support
+                  """,
+                "AWS tunnel received DELETE for IKE_SA from CGW" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  AWS CloudWatch monitoring has identified that your VPN tunnel went down because customer gateway (CGW) has sent the Delete_SA message for Parent/IKE_SA. When AWS receives Delete_SA  from CGW, it honours the message and brings down the VPN tunnel.
+                  There can be various reasons for CGW sending Delete_SA message like:
+                  *  A reset to clear active SAs has been performed on the CGW side
+                  *  IKE SA has been timed out
+                  *  Configurational changes have been made on CGW
+                  Next Steps:
+                  *  Review your VPN device idle timeout settings using information from your device vendor. When there is no traffic through a VPN tunnel for the duration of your vendor-specific VPN idle time, the IPsec session terminates. For more information on tunnel inactivity and instability refer to this documentation [1]
+                  *  Check logs on your CGW device to verify if you are able to see information pertaining to this issue.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [2].
+                  References:
+                  [1] Tunnel inactivity or instability: https://aws.amazon.com/premiumsupport/knowledge-center/vpn-tunnel-instability-inactivity/
+                  [2] https://aws.amazon.com/support
+                  """,
+                "DPD timed out":    """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has identified that your VPN tunnel went down due to Dead Peer Detection not being acknowledged by the customer gateway (CGW) device. AWS sends periodic DPD messages at configured intervals regardless of traffic inactivity. If the VPN peer does not respond to three successive DPDs, the VPN peer (CGW) is considered dead and AWS tears down the VPN tunnel. For detailed Information, please follow this documentation [1][2].
+                  Additionally, there are various potential reasons for a router to not be able to acknowledge the DPD messages sent by AWS VPN like CPU utilization on the device, power outage, loss of internet connectivity, or other internal configurational changes that might consume on-premises router resources and keep device busy as well.
+                  Next Steps:
+                  * In order to verify why the CGW device was not responding to our (AWS) DPD messages, we would recommend you to check the IPSec Logs on the CGW device to verify if you are able to see information pertaining to this issue.
+                  * To bring the VPN tunnel up you can restart your tunnel interface and initiate IKE and IPsec negotiations.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [3].
+                  References:
+                  [1] Resolution: https://aws.amazon.com/premiumsupport/knowledge-center/vpn-tunnel-instability-inactivity/.
+                  [2] DPD timeout action: https://docs.aws.amazon.com/vpn/latest/s2svpn/VPNTunnels.html
+                  [3] https://aws.amazon.com/support
+                  """,
+                "AWS tunnel Phase 2 was unable to establish while keeping Phase 1" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that Phase 2 of your VPN tunnel was not able to be established successfully while Phase 1 was established successfully.
+                  This can be caused if Phase 2 parameters (such as encryption algorithm, hashing algorithm and Diffie-Hellman (DH) group) configured on the customer gateway (CGW) device and the AWS VPN endpoint do not match or if the CGW is using parameters that are not supported by the AWS VPN.
+                  Next Steps:
+                  * Verify that the Phase 2 parameters (Integrity algorithm, Encryption algorithm, and Diffie-Hellman (DH) group) being proposed by CGW match those configured on the AWS side. If you are using default settings on the AWS side, then verify that the parameters being proposed are supported by the AWS VPN.  To find a list of parameters supported by AWS Site-to-Site VPN you can follow this documentation [1].
+                  * If you want to modify the parameters on the AWS VPN side, you can follow these steps:
+                  Step 1: Open the Amazon VPC console at https://console.aws.amazon.com/vpc/
+                  Step 2: In the navigation pane, choose Site-to-Site VPN Connections.
+                  Step 3: Select the Site-to-Site VPN connection and choose Actions, Modify VPN Tunnel Options.
+                  Step 4: For VPN Tunnel Outside IP Address, choose the tunnel endpoint IP of the VPN tunnel that your modifying options for.
+                  Step 5: Choose or enter new values for the tunnel options.
+                  Step 6: Choose Save.
+                  For information on Phase 2 troubleshooting, you can refer to this document [2]
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [3].
+                  References:
+                  [1] Tunnel options: https://docs.aws.amazon.com/vpn/latest/s2svpn/VPNTunnels.html
+                  [2] Phase 2 Troubleshooting: https://aws.amazon.com/premiumsupport/knowledge-center/vpn-tunnel-phase-2-ipsec/
+                  [3] https://aws.amazon.com/support
+                  """,
+                "AWS tunnel detected a (CHILD_REKEY) collision as CHILD_DELETE": """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that AWS has received Delete_SA from customer gateway (CGW) for the active SA which was being rekeyed. Possible reasons for this can be due to any stale SA states stuck between the Peers or any configurational changes performed during the rekey.
+                  Next Steps:
+                  * Check the IPSec Logs on the CGW Device to verify if there are any stale SAs which need to be cleared.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [1].
+                  References:
+                  [1] https://aws.amazon.com/support
+                  """,
+                "AWS tunnel (CHILD_SA) redundant SA is being deleted due to detected collision" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that there was a Rekey collision between customer gateway (CGW) and the AWS VPN, therefore AWS VPN has deleted the redundant SA. This can happen if both sides of the VPN connection initiate rekey at the same time and as a result redundant SAs are created through such a collision, however, redundant SA will be deleted afterwards.
+                  Next Steps:
+                  Deleting redundant SA does not cause the tunnel to go down. This is an expected behavior to deal with redundant SAs formed during rekey collision as per RFC standard. [1]
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [2].
+                  References:
+                  [1] https://www.rfc-editor.org/rfc/rfc7296#section-2.8.1
+                  [2] https://aws.amazon.com/support
+                  """,
+                "TS_UNACCEPTABLE" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                    The automation has detected that AWS has received \"Traffic Selector: TS_UNACCEPTABLE\" from customer gateway (CGW) during IKE negotiations. This error is typically caused when there is a mismatch in the traffic selectors/encryption domain between the Customer Gateway (CGW) device and AWS VPN. This can also happen if you are using a policy-based VPN with multiple encryption domains to connect to AWS VPN endpoint. AWS end of the VPN connection is a Route based VPN, it limits the number of security associations to a single pair.
+                    Next Steps:
+                    * Verify that traffic selectors/encryption domains configured on CGW side are reflected correctly according to the "Local IPv4 network CIDR" (CGW) and "Remote IPv4 network CIDR" (AWS) values specified on AWS side.
+                    * If you are using policy-based VPN and have more than one encryption domain behind your VPN customer gateway then configure it to use a single security association. For further information on using Policy based VPN with AWS you can refer to this documentation [1]
+                    If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [2].
+                    References:
+                    [1] https://aws.amazon.com/premiumsupport/knowledge-center/vpn-connection-instability/
+                    [2] https://aws.amazon.com/support
+                  """,
+                "AWS tunnel is sending AUTHENTICATION_FAILED as the response" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that AWS VPN failed to authenticate the customer gateway (CGW) device. It was not able to verify IKE_AUTH message contents hence it has sent AUTHENTICATION_FAILED message back to CGW. IKE_AUTH message exchanges peer identities, authentication information (PSK/Certificate) and establish the first Child SA. This error indicates there is issue in verifying either peer identity or authentication.
+                  The error message \"AWS tunnel is sending AUTHENTICATION_FAILED as the response\" can be caused by following reasons:
+                  *  Incorrectly configured pre-shared key (PSK): If the PSK on the Customer Gateway (CGW) and AWS VPN do not match, the authentication process will fail and the error message will be generated.
+                  *  Incorrectly configured digital certificates: If the digital certificate on the CGW and VGW are not properly configured, they will not be able to authenticate each other and the error message will be generated.
+                  * Issue in Identification Payload: If the Peer IP address in ID payload does not match with the IP of CGW configured on AWS VPN side, AWS will not be able to authenticate the peer and the error message will be generated.
+                  Next Steps:
+                  Please follow below steps in order to verify the PSK:
+                  Step 1: Open the Amazon VPC console at https://console.aws.amazon.com/vpc/.
+                  Step 2: In the navigation pane, choose Site-to-Site VPN Connections.
+                  Step 3: Select your VPN connection and choose Download Configuration.
+                  Step 4: Select the vendor, platform, software and IKE version that correspond to your customer gateway device. If your device is not listed, choose Generic.
+                  Step 5: Choose Download.
+                  Step 6: Downloaded file will contain the pre-shared key.
+                  *  For certificate-based authentication, verify that CGW has installed all the certificates required for authentication. For more information on using certificate-based VPN you can refer to following documentation [1]
+                  *  Verify that CGW device is configured properly to propose valid IP in Identification Payload.
+                  References:
+                  [1] https://aws.amazon.com/premiumsupport/knowledge-center/vpn-certificate-based-site-to-site/
+                  """,
+                "pre-shared key mismatch" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that there is a pre-shared key mismatch between both the peer IPs. To resolve this issue Please verify that the PSK configured on the customer gateway (CGW) device [1] and ensure it matches with the PSK matching with the downloaded configuration file. If you are using a custom PSK value, make sure it matches on both the CGW and AWS VPN console.
+                  Please follow these steps in order to verify the PSK:
+                  Step 1: Open the Amazon VPC console at https://console.aws.amazon.com/vpc/.
+                  Step 2: In the navigation pane, choose Site-to-Site VPN Connections.
+                  Step 3: Select your VPN connection and choose Download Configuration.
+                  Step 4: Select the vendor, platform, software and IKE version that correspond to your customer gateway device. If your device is not listed, choose Generic.
+                  Step 5: Choose Download.
+                  Step 6: Downloaded file will contain the pre-shared key.
+                  Or
+                  If you want to modify the PSK on the AWS VPN side, you can follow these steps:
+                  Step 1: Open the Amazon VPC console at https://console.aws.amazon.com/vpc/
+                  Step 2: In the navigation pane, choose Site-to-Site VPN Connections.
+                  Step 3: Select the Site-to-Site VPN connection, and choose Actions, Modify VPN Tunnel Options.
+                  Step 4: For VPN Tunnel Outside IP Address, choose the tunnel endpoint IP of the VPN tunnel that your modifying options for.
+                  Step 5: Choose or enter new values for the tunnel options (pre-shared key).
+                  Step 6: Choose Save.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [2].
+                  References:
+                  [1] Requirements for your customer gateway device: https://docs.aws.amazon.com/vpn/latest/s2svpn/your-cgw.html#CGRequirements
+                  [2] https://aws.amazon.com/support
+                  """,
+                "deleting un-established Phase 1 IKE_SA with cgw" : """
+                  \u2705 Consider the following as a possible solution to this error:
+                  The automation has detected that AWS VPN endpoint did not receive any response to IKE negotiations from customer gateway (CGW) device. As CGW did not respond, IKE SA timed out and AWS deleted unestablished tunnel from its end. This usually indicates that IPSec traffic from AWS is not reaching CGW, it can be blocked by the CGW or any firewall in front of the CGW
+                  Next Steps:
+                  * Verify the network connectivity between CGW and AWS VPN endpoint by pinging the AWS VPN IP from CGW device.
+                  * Verify that CGW or any Firewall on the network is allowing Ingress traffic for UDP 500 and UDP 4500 (in case of NAT traversal) from AWS VPN-endpoint public IPs.
+                  * Check for any software or hardware failure on CGW side.
+                  If you have any questions or need further guidance or assistance, please contact AWS Support via a Support case [1].
+                  References:
+                  [1] https://aws.amazon.com/support
+                  """
+                }
+              encoded_zipped_data = event['awslogs']['data']
+              zipped_data = base64.b64decode(encoded_zipped_data)
+              data = gzip.decompress(zipped_data)
+              data = json.loads(data)
+              Message=""
+              Subject=""
+              logstream = data['logStream']
+              logGroup = data['logGroup']
+              token=logstream.split("-")
+              vpnId=token[0]+"-"+token[1]
+              vpnIp=token[2]
+              vpn_index = vpnId+"_"+vpnIp
+              occurance = ''
+              for log in data['logEvents']:
+                  log_epoch_timestamp = log['timestamp']
+                  lg = json.loads(log['message'])
+                  event_timestamp = lg['event_timestamp']
+                  for error in errorDescription:
+                    if error in log['message']:
+                      response = table.get_item(Key={"vpnId_and_tunnelIp":vpn_index})
+                      if 'Item' in response:
+                        vpn_tunnel = response['Item']['vpnId_and_tunnelIp']
+                        if error in response['Item']:
+                          error_last_notification = response['Item'][error]
+                          if event_timestamp - int(error_last_notification) >= NotificationFrequency:
+                            update_item(vpn_index, error, event_timestamp)
+                            send_sns(error, errorDescription[error], data['owner'], vpnId, vpnIp, logGroup, context.function_name)
+                            break
+                          else:
+                            break
+                        else:
+                          update_item(vpn_index, error, event_timestamp)
+                          send_sns(error, errorDescription[error], data['owner'], vpnId, vpnIp, logGroup, context.function_name)
+                      else:
+                        create_put_item(vpn_index, error, event_timestamp)
+                        send_sns(error, errorDescription[error], data['owner'], vpnId, vpnIp, logGroup, context.function_name)
+                        break
+
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Timeout: 900
+      Role: !If
+        - LambdaRoleCondition
+        - !GetAtt NewLambdaExecutionRole.Arn
+        - !Ref ExistingLambdaRoleARN
+
+  LambdaCloudwatchInvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: NotificationFunction
+    Properties:
+      FunctionName: !Ref NotificationFunction
+      Principal: !Sub logs.${AWS::Region}.amazonaws.com
+      Action: lambda:InvokeFunction
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${VpnLogGroup}:*
+
+  subscriptionfilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: LambdaCloudwatchInvokePermission
+    Properties:
+      DestinationArn: !GetAtt NotificationFunction.Arn
+      FilterName: SetupVPNMonitoring
+      FilterPattern: '{($.details = "*No proposal chosen*") || ($.details = "*Peer is
+        not responsive*") || ($.details = "*AWS tunnel received DELETE for
+        IKE_SA from CGW*" && $.ike_phase1_state = "down") || ($.details = "*AWS
+        tunnel received DELETE for Phase 2 SA*" && $.ike_phase2_state = "down")
+        || ($.details = "*No Proposal Match Found by AWS*") || ($.details =
+        "*invalid Pre-shared Key*") || ($.details = "*DPD timed out*") ||
+        ($.details = "*AWS tunnel detected a (CHILD_REKEY) collision as
+        CHILD_DELETE*") || ($.details = "*AWS tunnel (CHILD_SA) redundant SA is
+        being deleted due to detected collision*") || ($.details = "*AWS tunnel
+        Phase 2 was unable to establish while keeping Phase 1*") || ($.details =
+        "*AWS: Traffic Selector: TS_UNACCEPTABLE: received from responder*") ||
+        ($.details = "*AWS tunnel is sending AUTHENTICATION_FAILED as the
+        response*") || ($.details = "*pre-shared key mismatch*") || ($.details =
+        "*AWS tunnel Timeout: deleting un-established Phase 1 IKE_SA with
+        cgw*")}'
+      LogGroupName: !Ref VpnLogGroup
