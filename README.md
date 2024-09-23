@@ -2,7 +2,7 @@
 
 The solution creats a monitoring setup for your AWS Site-To-Site VPN connection and helps diagnose AWS Site - to - Site VPN issues by notifying you when an error occurs in your VPN and is logged to designated CloudWatch log group. 
 
-You can read the Blog: Setting up of AWS Site-to-Site VPN automated monitoring solution for deployment steps and more information
+You can read the Blog: [Setting up of AWS Site-to-Site VPN automated monitoring solution](https://aws.amazon.com/blogs/networking-and-content-delivery/setting-up-of-aws-site-to-site-vpn-automated-monitoring-solution/) for deployment steps and more information
 ## Table of Content
 
 1. [Overview](#overview-required)
